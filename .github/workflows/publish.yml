@@ -1,0 +1,120 @@
+name: Publish preprint release
+
+on:
+  workflow_dispatch:
+    inputs:
+      acknowledge_immutable_enabled:
+        description: 'I enabled Settings > General > Releases > Enable release immutability.'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preprint-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # Only this manually triggered job may create a draft/publish a Release.
+    steps:
+      - name: Require explicit preconditions
+        env:
+          ACKNOWLEDGED: ${{ inputs.acknowledge_immutable_enabled }}
+          IS_PRIVATE: ${{ github.event.repository.private }}
+          REF_NAME: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test "$ACKNOWLEDGED" = "true" || { echo 'Confirm the immutable release setting before publishing.' >&2; exit 1; }
+          test "$IS_PRIVATE" = "false" || { echo 'Preprints must be published from public repositories.' >&2; exit 1; }
+          test "$REF_NAME" = "refs/heads/$DEFAULT_BRANCH" || { echo 'Publish only from the default branch.' >&2; exit 1; }
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --require-hashes -r requirements-build.lock && python -m pip install --require-hashes --no-build-isolation -r requirements.lock # locked requirements.txt + requirements-publication-checks.txt
+      - name: Test, build, and verify release assets locally
+        env:
+          PREPRINT_REPOSITORY: ${{ github.repository }}
+          PREPRINT_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+          python scripts/research_record.py
+          python scripts/research_package.py --check
+          python scripts/prepare_release.py --output dist --repository "$PREPRINT_REPOSITORY" --commit "$PREPRINT_COMMIT"
+          python scripts/verify_release.py dist
+          python scripts/citation_validation.py dist
+      - name: Verify publication preconditions through GitHub API
+        env:
+          GH_TOKEN: ${{ secrets.OPK_ADMIN_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="$(python -c 'import json; print(json.load(open("dist/preprint-metadata.json", encoding="utf-8"))["version"])')"
+          python scripts/preflight.py --repository "$GITHUB_REPOSITORY" --version "$TAG" --commit "$GITHUB_SHA"
+      - name: Obtain and verify RFC 3161 evidence before creating a Release
+        run: |
+          set -euo pipefail
+          test -f timestamp-policy.json || { echo 'Configure timestamp-policy.json and independently trusted CA/CRLs first.' >&2; exit 1; }
+          python scripts/timestamp.py stamp dist --policy timestamp-policy.json
+          python scripts/timestamp.py verify dist --policy timestamp-policy.json
+      - name: Create draft and verify downloaded evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$(python -c 'import json; print(json.load(open("dist/preprint-metadata.json", encoding="utf-8"))["version"])')"
+          TITLE="$(python -c 'import json; print(" ".join(json.load(open("dist/preprint-metadata.json", encoding="utf-8"))["title"].split()))')"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Use a NEW version instead of overwriting it." >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists. A release cannot reuse a historical tag." >&2
+            exit 1
+          fi
+          RESEARCH_ASSETS=()
+          if [ -f dist/research-assets.tar ]; then
+            test -f dist/research-assets.json || { echo "Research catalog missing" >&2; exit 1; }
+            RESEARCH_ASSETS=(dist/research-assets.json dist/research-assets.tar)
+          fi
+          gh release create "$TAG" \
+            dist/paper.pdf dist/preprint-metadata.json dist/CITATION.cff \
+            dist/citation.bib dist/manifest.json dist/SHA256SUMS dist/RELEASE_NOTES.md \
+            "${RESEARCH_ASSETS[@]}" \
+            dist/timestamp.tsq dist/timestamp.tsr \
+            --draft --target "$GITHUB_SHA" --title "$TITLE ($TAG)" \
+            --notes-file dist/RELEASE_NOTES.md
+          mkdir -p downloaded-release
+          gh release download "$TAG" --dir downloaded-release
+          diff -qr dist downloaded-release
+          python scripts/verify_release.py downloaded-release
+          python scripts/citation_validation.py downloaded-release
+          python scripts/timestamp.py verify downloaded-release --policy timestamp-policy.json
+      - name: Recheck immutability immediately before promotion
+        env:
+          GH_TOKEN: ${{ secrets.OPK_ADMIN_READ_TOKEN }}
+        run: python scripts/preflight.py --repository "$GITHUB_REPOSITORY" --immutable-only
+      - name: Publish verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$(python -c 'import json; print(json.load(open("dist/preprint-metadata.json", encoding="utf-8"))["version"])')"
+          gh release edit "$TAG" --draft=false
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)" != "true" ]; then
+            echo "::error::Release is already public, but GitHub did not confirm immutability. Inspect settings immediately."
+            exit 1
+          fi
+          echo "Published: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
